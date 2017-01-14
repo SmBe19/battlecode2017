@@ -9,17 +9,17 @@ import java.util.*;
  */
 public class PathFinder {
 
-	private static class pqEntry implements Comparable<pqEntry>{
+	private static class PqEntry implements Comparable<PqEntry>{
 		final float dist;
 		final MapLocation location;
 
-		public pqEntry(float dist, MapLocation location) {
+		public PqEntry(float dist, MapLocation location) {
 			this.dist = dist;
 			this.location = location;
 		}
 
 		@Override
-		public int compareTo(pqEntry o) {
+		public int compareTo(PqEntry o) {
 			if(dist == o.dist){
 				return location.compareTo(o.location);
 			}
@@ -27,22 +27,47 @@ public class PathFinder {
 		}
 	}
 
-	private static class distEntry{
+	private static class DistEntry {
 		final MapLocation location;
 		float dist;
-		distEntry parent;
+		DistEntry parent;
 		boolean done = false;
 
-		public distEntry(MapLocation location, float dist, distEntry parent) {
+		public DistEntry(MapLocation location, float dist, DistEntry parent) {
 			this.location = location;
 			this.dist = dist;
 			this.parent = parent;
 		}
 	}
 
-	private static void addToRes(List<MapLocation> res, Map<MapLocation, distEntry> dist, distEntry element) {
+	private float stride, bodyRadius, strideSquared, distStartDestSquared;
+	private float meshSize = Consts.PATHFINDER_MESH_SIZE;
+	private MapLocation start, dest;
+	private boolean useRobots;
+	private PriorityQueue<PqEntry> pq;
+	private Map<MapLocation, DistEntry> dist;
+	private List<BodyInfo> obstacles;
+	private DistEntry root;
+
+	private boolean calculating = false;
+	private boolean ready = false;
+	private boolean foundDest = false;
+
+	private int oldByteCount = 0;
+	private int oldRoundNum = 0;
+
+	public void init() {
+		stride = RobotPlayer.rc.getType().strideRadius;
+		bodyRadius = RobotPlayer.rc.getType().bodyRadius;
+		strideSquared = stride * stride;
+		pq = new PriorityQueue<>();
+		dist = new HashMap<>();
+		obstacles = new ArrayList<>();
+	}
+
+	private static void addToRes(List<MapLocation> res, DistEntry element) {
 		if(element != null){
-			addToRes(res, dist, element.parent);
+			addToRes(res, element.parent);
 			res.add(element.location);
 		}
 	}
@@ -51,22 +76,28 @@ public class PathFinder {
 		return Math.round(val * Consts.PATHFINDER_ROUND) / Consts.PATHFINDER_ROUND;
 	}
 
-	public static List<MapLocation> findPath(MapLocation start, MapLocation dest, boolean chooseRandomIfNotFound, boolean useRobots) throws GameActionException {
-		float stride = RobotPlayer.rc.getType().strideRadius;
-		float bodyRadius = RobotPlayer.rc.getType().bodyRadius;
-		float strideSquared = stride * stride;
-		List<MapLocation> res = new ArrayList<>();
-		PriorityQueue<pqEntry> pq = new PriorityQueue<>();
-		Map<MapLocation, distEntry> dist = new HashMap<>();
+	public void reset(){
+		calculating = false;
+		ready = false;
+		foundDest = false;
+	}
 
-		MapLocation niceDest = new MapLocation(
-				Math.min(RobotPlayer.mapPos[1], Math.max(RobotPlayer.mapPos[3], round(dest.x))),
-				Math.min(RobotPlayer.mapPos[0], Math.max(RobotPlayer.mapPos[2], round(dest.y))));
-		// System.out.println("dest / nicedest: " + dest + " / " + niceDest);
+	public void findPath(MapLocation exactStart, MapLocation exactDest, boolean useRobots) throws GameActionException {
+		calculating = true;
+		ready = false;
+		foundDest = false;
+		pq.clear();
+		dist.clear();
+		obstacles.clear();
+
+		start = exactStart;
+		dest = new MapLocation(
+				Math.min(RobotPlayer.mapPos[1], Math.max(RobotPlayer.mapPos[3], round(exactDest.x))),
+				Math.min(RobotPlayer.mapPos[0], Math.max(RobotPlayer.mapPos[2], round(exactDest.y))));
+		this.useRobots = useRobots;
+		distStartDestSquared = start.distanceSquaredTo(dest);
 
 		// clean trees and robots
-		float distStartDestSquared = start.distanceSquaredTo(niceDest);
-		List<BodyInfo> obstacles = new ArrayList<>();
 		for (TreeInfo tree : RobotPlayer.trees) {
 			if (start.distanceSquaredTo(tree.location) <= distStartDestSquared) {
 				obstacles.add(tree);
@@ -80,28 +111,37 @@ public class PathFinder {
 			}
 		}
 
-		// System.out.println("obstacles: " + obstacles.size());
+		meshSize = distStartDestSquared > Consts.PATHFINDER_DISTSQ_TOO_LARGE ? Consts.PATHFINDER_MESH_SIZE_LARGE : Consts.PATHFINDER_MESH_SIZE;
 
-		distEntry root = new distEntry(start, 0, null);
+		root = new DistEntry(start, 0, null);
 		dist.put(start, root);
-		pq.add(new pqEntry(0, start));
+		pq.add(new PqEntry(0, start));
+	}
 
-		while (!pq.isEmpty()) {
-			pqEntry aepq = pq.poll();
+	public void update() throws GameActionException {
+		if (!calculating) {
+			return;
+		}
+//		oldRoundNum = RobotPlayer.rc.getRoundNum();
+		while (!pq.isEmpty() && Clock.getBytecodesLeft() > Consts.PATHFINDER_BYTECODE_PER_CYCLE) {
+			PqEntry aepq = pq.poll();
 			MapLocation aepqlocation = aepq.location;
-			distEntry aedist = dist.get(aepqlocation);
+			DistEntry aedist = dist.get(aepqlocation);
 			if(aedist.done || aedist.location.distanceSquaredTo(start) > distStartDestSquared * Consts.PATHFINDER_MAX_DISTSQ_MULT){
 				continue;
 			}
 			aedist.done = true;
 
 			// System.out.println("aepq " + aepqlocation + " " + aepq.dist);
-			RobotPlayer.rc.setIndicatorDot(aepqlocation, 256, 0, 0);
-			RobotPlayer.rc.setIndicatorDot(niceDest, 256, 128, 128);
+//			RobotPlayer.rc.setIndicatorDot(aepqlocation, 256, 0, 0);
+//			RobotPlayer.rc.setIndicatorDot(dest, 256, 128, 128);
 
-			if(niceDest.distanceSquaredTo(aepqlocation) <= strideSquared){
-				dist.put(niceDest, new distEntry(niceDest, aepq.dist + niceDest.distanceTo(aepqlocation), aedist));
-				break;
+			if(dest.distanceSquaredTo(aepqlocation) <= strideSquared){
+				dist.put(dest, new DistEntry(dest, aepq.dist + dest.distanceTo(aepqlocation), aedist));
+				ready = true;
+				foundDest = true;
+				calculating = false;
+				return;
 			}
 
 			float startx = Math.max(RobotPlayer.mapPos[3], aepqlocation.x - stride);
@@ -109,28 +149,25 @@ public class PathFinder {
 			float endx = Math.min(RobotPlayer.mapPos[1], aepqlocation.x + stride);
 			float endy = Math.min(RobotPlayer.mapPos[0], aepqlocation.y + stride);
 			// System.out.println("start / end: " + startx + " " + starty + " " + endx + " " + endy);
-			for(float x = startx; x <= endx; x += Consts.PATHFINDER_MESH_SIZE) {
-				for(float y = starty; y <= endy; y += Consts.PATHFINDER_MESH_SIZE) {
+			for(float x = startx; x <= endx; x += meshSize) {
+				yloop:
+				for(float y = starty; y <= endy; y += meshSize) {
 					MapLocation newLoc = new MapLocation(round(x), round(y));
-					if(aepqlocation.distanceSquaredTo(newLoc) <= strideSquared){
-						boolean possible = true;
+					float distToNewLoc = aepqlocation.distanceTo(newLoc);
+					if(distToNewLoc <= stride){
 						for (BodyInfo body : obstacles) {
-							if(newLoc.distanceTo(body.getLocation()) <= bodyRadius + body.getRadius() + Consts.PATHFINDER_COLLISION_MARGIN){
-								RobotPlayer.rc.setIndicatorDot(body.getLocation(), 0, 256, 0);
-								possible = false;
-								break;
+							if(newLoc.distanceTo(body.getLocation()) <= bodyRadius + body.getRadius()){
+//								RobotPlayer.rc.setIndicatorDot(body.getLocation(), 0, 256, 0);
+								continue yloop;
 							}
 						}
-						if(!possible){
-							continue;
-						}
-						float newDist = aedist.dist + aepqlocation.distanceTo(newLoc);
-						if (!dist.containsKey(newLoc)) {
-							dist.put(newLoc, new distEntry(newLoc, newDist, aedist));
+						float newDist = aedist.dist + distToNewLoc;
+						DistEntry distEntry = dist.get(newLoc);
+						if (distEntry == null) {
+							dist.put(newLoc, new DistEntry(newLoc, newDist, aedist));
 							// squared is kinda wrong, but this will get faster results
-							pq.add(new pqEntry(newDist + newLoc.distanceSquaredTo(niceDest), newLoc));
+							pq.add(new PqEntry(newDist + newLoc.distanceSquaredTo(dest), newLoc));
 						} else {
-							distEntry distEntry = dist.get(newLoc);
 							if(newDist < distEntry.dist){
 								distEntry.dist = newDist;
 								distEntry.parent = aedist;
@@ -140,13 +177,49 @@ public class PathFinder {
 				}
 			}
 		}
-
-		distEntry destElement = dist.get(niceDest);
-		if (destElement == null && chooseRandomIfNotFound) {
-			destElement = (distEntry) dist.values().toArray()[RobotPlayer.rnd.nextInt(dist.size())];
+		if (pq.isEmpty()) {
+			ready = true;
+			calculating = false;
 		}
-		addToRes(res, dist, destElement);
+//		if(oldRoundNum != RobotPlayer.rc.getRoundNum()){
+//			System.out.println("!!!!!!!!!!!! PathFinder takes too long !!!!!!!!!!!!");
+//		}
+	}
 
+	public float getMeshSize() {
+		return meshSize;
+	}
+
+	public void setMeshSize(float meshSize) {
+		this.meshSize = meshSize;
+	}
+
+	public boolean isCalculating() {
+		return calculating;
+	}
+
+	public boolean isReady(){
+		return ready;
+	}
+
+	public boolean isFoundDest() {
+		return foundDest;
+	}
+
+	public List<MapLocation> getPath(){
+		List<MapLocation> res = new ArrayList<>();
+		DistEntry destElement = dist.get(dest);
+		addToRes(res, destElement);
+		return res;
+	}
+
+	public List<MapLocation> getRandomPath(){
+		List<MapLocation> res = new ArrayList<>();
+		if (dist.isEmpty()) {
+			return res;
+		}
+		DistEntry destElement = (DistEntry) dist.values().toArray()[RobotPlayer.rnd.nextInt(dist.size())];
+		addToRes(res, destElement);
 		return res;
 	}
 }
